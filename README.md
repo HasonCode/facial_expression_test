@@ -1,0 +1,1 @@
+Establishing a basic convolutional neural network for facial recognition of self as a second practice in exploring such models. Collected >7000 samples to train off of to recognize given emotions in my face.
