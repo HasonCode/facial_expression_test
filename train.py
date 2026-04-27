@@ -1,109 +1,185 @@
+import argparse
+import random
+from pathlib import Path
+
+import PIL.Image
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from skimage import io, transform
-import pandas as pd
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
-import os
-from typing import Union 
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 import FaceExpressionDataset as fed
+from model import create_binary_emotion_model
 
 
-train_set = fed.FaceExpressionDataset("dataset",transforms.Compose([transforms.ToTensor(),transforms.Resize((256,256))]))
-train_loader = DataLoader(train_set, batch_size=64, shuffle = True, num_workers = 2)
+classifications = ["anger", "blink"]
 
-test_set = fed.FaceExpressionDataset("dataset",transforms.Compose([transforms.ToTensor(),transforms.Resize((256,256))]))
-test_loader = DataLoader(train_set, batch_size=64, shuffle = False, num_workers = 2)
 
-classifications = ["anger","blink","frown","neutral","smile"]
+class BinarySubset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, indices, transform):
+        self.base_dataset = base_dataset
+        self.indices = indices
+        self.transform = transform
 
-class CNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3,32,3,1, padding = 1)
-        self.gap = nn.AdaptiveMaxPool2d((1,1))
-        self.pool = nn.MaxPool2d(2,2)
-        self.conv2 = nn.Conv2d(32,64,3, padding = 1)
-        self.conv3 = nn.Conv2d(64,128,3, padding = 1)
-        self.conv4 = nn.Conv2d(128,256,3, padding = 1)
-        self.fc1 = nn.Linear(256, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 5)
+    def __len__(self):
+        return len(self.indices)
 
-    def forward(self, x:torch.Tensor):
-        out = self.pool(F.relu(self.conv1(x)))
-        out = self.pool(F.relu(self.conv2(out)))
-        out = self.pool(F.relu(self.conv3(out)))
-        out = self.pool(F.relu(self.conv4(out)))
-        out = self.gap(out)
-        out = torch.flatten(out, 1)
-        out = F.relu(self.fc1(out))
-        out = F.relu(self.fc2(out))
-        out = self.fc3(out)
-        return out
-    
+    def __getitem__(self, idx):
+        base_idx = self.indices[idx]
+        img_path, label = self.base_dataset.samples[base_idx]
+        img = PIL.Image.open(img_path).convert("RGB")
+        img = self.transform(img)
+        return img, label
+
+
 if __name__ == "__main__":
-
-    cnn = CNN()
-
     import torch.optim as optim
-    device = torch.device("cpu")
-    state_dict = torch.load("emotion_set.pth")
-    cnn.load_state_dict(state_dict)
-    cnn = cnn.to(device)
-    num_classes = 5
-    class_counts = torch.tensor([1814, 1853, 1240, 1264, 1214],dtype=torch.float)
-    weights = class_counts.sum()/(num_classes*class_counts)
 
+    parser = argparse.ArgumentParser(description="Train binary anger-vs-blink classifier.")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    args = parser.parse_args()
+    epochs_to_run = max(1, args.epochs)
+
+    seed = 42
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    train_transform = transforms.Compose(
+        [
+            transforms.Resize((256, 256), interpolation=InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=12),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize((256, 256), interpolation=InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    full_set = fed.FaceExpressionDataset("dataset", transform=None)
+
+    # Keep only anger (0) and blink (1) for binary model.
+    binary_indices = [idx for idx, (_, label) in enumerate(full_set.samples) if label in (0, 1)]
+    if not binary_indices:
+        raise RuntimeError("No samples found for binary classes anger/blink.")
+
+    # Stratified split so each class keeps similar train/val proportions.
+    train_ratio = 0.8
+    train_indices = []
+    val_indices = []
+    g = torch.Generator().manual_seed(seed)
+    label_to_indices = {i: [] for i in range(len(classifications))}
+    for idx in binary_indices:
+        _, label = full_set.samples[idx]
+        label_to_indices[label].append(idx)
+
+    for indices in label_to_indices.values():
+        idx_tensor = torch.tensor(indices)
+        perm = idx_tensor[torch.randperm(len(indices), generator=g)].tolist()
+        cut = int(len(perm) * train_ratio)
+        train_indices.extend(perm[:cut])
+        val_indices.extend(perm[cut:])
+
+    train_set = BinarySubset(full_set, train_indices, train_transform)
+    val_set = BinarySubset(full_set, val_indices, eval_transform)
+    use_pin_memory = device.type in {"cuda", "mps"}
+    train_loader = DataLoader(train_set, batch_size=32, shuffle=True, num_workers=0, pin_memory=use_pin_memory)
+    test_loader = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=0, pin_memory=use_pin_memory)
+
+    model = create_binary_emotion_model().to(device)
+
+    # Dynamic class weights from training split only.
+    train_class_counts = torch.zeros(len(classifications), dtype=torch.float32)
+    for idx in train_indices:
+        _, label = full_set.samples[idx]
+        train_class_counts[label] += 1.0
+    weights = train_class_counts.sum() / (len(classifications) * train_class_counts.clamp_min(1.0))
     loss_func = nn.CrossEntropyLoss(weight=weights.to(device))
 
-    losses,epochs = [],[]
+    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs_to_run)
 
-    optimizer = optim.SGD(cnn.parameters(), lr=0.01, momentum = 0.9)
+    losses, epochs = [], []
+    best_val_acc = 0.0
+    best_model_path = Path("emotion_set_binary.pth")
 
-    device = torch.device("cpu")
-
-    for epoch in range(10):
+    for epoch in range(epochs_to_run):
+        model.train()
         running_loss = 0.0
         correct = 0
         total = 0
         count = 0
-        for i, data in enumerate(train_loader):
 
+        for i, data in enumerate(train_loader):
             inputs, labels = data
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = cnn(inputs)
+            outputs = model(inputs)
             pred = outputs.argmax(dim=1)
             correct += (pred == labels).sum().item()
             total += labels.size(0)
 
             loss = loss_func(outputs, labels)
-            p0 = cnn.fc3.weight.detach().clone()
             loss.backward()
-            # print(cnn.conv1.weight.grad.abs().mean().item())
-            print(f"{i*64/len(train_set)*100:.4f}% Progress, Accuracy: {correct/total:.5f}")
             optimizer.step()
             running_loss += loss.item()
-            count+=1
-            # do ONE optimizer step
-            p1 = cnn.fc3.weight.detach().clone()
-            # print("fc3 mean |Δ|:", (p1 - p0).abs().mean().item())
+            count += 1
 
+            if i % 20 == 0:
+                print(
+                    f"Epoch {epoch + 1}/{epochs_to_run} | "
+                    f"{i * len(inputs)}/{len(train_set)} | "
+                    f"train_acc={correct / max(1, total):.4f}"
+                )
 
-        print(f"{epoch+1} loss: {running_loss/count:.7f}")
-        print(f"{epoch+1} Accuracy: {correct/total:.3f}")
-        losses.append(running_loss/count)
-        epochs.append(epoch+1)
+        # Validation metrics
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                pred = outputs.argmax(dim=1)
+                val_correct += (pred == labels).sum().item()
+                val_total += labels.size(0)
 
-    print("all trained")
+        train_acc = correct / max(1, total)
+        val_acc = val_correct / max(1, val_total)
+        avg_loss = running_loss / max(1, count)
+        scheduler.step()
 
-    torch.save(cnn.state_dict(),"emotion_set2.pth")
+        print(f"{epoch + 1} loss: {avg_loss:.7f}")
+        print(f"{epoch + 1} train Accuracy: {train_acc:.3f}")
+        print(f"{epoch + 1} val Accuracy: {val_acc:.3f}")
 
-    plt.plot(epochs,losses)
-    plt.savefig("lossvsepoch.png")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Saved new best model at val_acc={best_val_acc:.3f}")
+
+        losses.append(avg_loss)
+        epochs.append(epoch + 1)
+
+    print(f"all trained, best val accuracy={best_val_acc:.3f}")
+
+    plt.plot(epochs, losses)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.savefig("lossvsepoch_binary.png")
     plt.show()

@@ -55,7 +55,7 @@ def save_label(label:str, label_directory:str, number:int, frame):
     cv.imwrite(f"{label_directory}/{label}/{label}_{number}.png", frame)
 
 
-neutral_count,smile_count,blink_count,frown_count,anger_count=923,1,1344,1,1239
+neutral_count,smile_count,blink_count,frown_count,anger_count=1,1,1,1,1
 with FaceDetector.create_from_options(options) as detector:
     try:
         while True:
@@ -82,7 +82,7 @@ with FaceDetector.create_from_options(options) as detector:
                 cv.imshow("picture",frame)
             else:
                 cv.imshow("picture",frame)
-            key_collect = cv.waitKey(0)
+            key_collect = cv.waitKey(1)
             if (key_collect == ord('q')):
                 break
             elif (key_collect==ord("1")): #neutral

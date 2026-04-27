@@ -1,29 +1,32 @@
 """
-Flappy Bird game controlled by smiling.
-Uses blaze_face_short_range.tflite for face detection and emotion_set.pth (CNN) for expression.
-Smile (class=4) makes the bird jump. Press R to reset. Face bounding boxes shown on camera feed.
+Flappy Bird controlled by eye state (blink vs. open) via MediaPipe Face Mesh.
+Eyes open: lift. Blinking/closed: extra downward acceleration.
+Press R to reset. Camera on the right with face + eye status.
 """
 
 import cv2 as cv
 import numpy as np
-import time
 import mediapipe as mp
+import pygame
+import time
+from pathlib import Path
+from urllib.request import urlretrieve
+from collections import Counter, deque
 import torch
 from torchvision import transforms
-import PIL
-from train import CNN
-import pygame
+import PIL.Image
+from torchvision.transforms import InterpolationMode
+from model import create_binary_emotion_model
 
 # --- Game constants ---
-GAME_WIDTH = 400
-GAME_HEIGHT = 600
+GAME_WIDTH = 1040
+GAME_HEIGHT = 1520
 BIRD_SIZE = 40
 GRAVITY = 0.6
-JUMP_VEL = -10
 PIPE_WIDTH = 60
-PIPE_GAP = 180
-PIPE_SPEED = 3
-PIPE_SPAWN_INTERVAL = 90
+PIPE_GAP = 300
+PIPE_SPEED = 4
+PIPE_SPAWN_INTERVAL = 125
 BIRD_X = 80
 GROUND_HEIGHT = 50
 SKY_COLOR = (113, 197, 207)
@@ -31,29 +34,54 @@ PIPE_COLOR = (34, 139, 34)
 GROUND_COLOR = (222, 184, 135)
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-CAM_WIDTH, CAM_HEIGHT = 640, 480
+CAM_WIDTH, CAM_HEIGHT = 1600, 1200
 
-# --- Globals ---
-timer = 0
-prev_timer = 0
-initial_time = time.monotonic_ns()
-latest_res = {"result": None}
+# Binary CNN classes:
+# 0=anger, 1=blink
+BLINK_CLASS = 1
+CLASS_NAMES = ["anger", "blink"]
+VOTE_WINDOW = 3
+# Inference bias tuning (logit offsets) for binary model [anger, blink].
+CLASS_LOGIT_BIAS = [0.0, 0.0]
+
+# Physics: instant direction switch (no inertia buildup)
+RISE_SPEED = -9.0     # px/frame while eyes open
+FALL_SPEED = 9.0      # px/frame while blinking/closed
+
+# Audio height cue
+SAMPLE_RATE = 22050
+TONE_MS = 45
+TONE_VOL = 0.16
+PITCH_MIN_HZ = 220
+PITCH_MAX_HZ = 1100
+PITCH_UPDATE_MS = 55
+
+FACE_LANDMARKER_MODEL = "face_landmarker.task"
+FACE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
+)
+EMOTION_MODEL_PATH = "emotion_set_binary.pth"
 
 
-def push_next_stamp(prev: int, initial: int) -> int:
-    cur = (time.monotonic_ns() - initial) // 1_000_000
-    if cur <= prev:
-        cur = prev + 1
-    return int(cur)
+def _ensure_face_landmarker_model(model_path: Path) -> None:
+    if model_path.exists():
+        return
+    print(f"Downloading {model_path.name} for MediaPipe FaceLandmarker...")
+    urlretrieve(FACE_LANDMARKER_URL, model_path)
+    print(f"Saved model to {model_path}")
 
 
-def face_callback(result, output_image, timestamp_ms):
-    latest_res["result"] = result
+def _make_tone(freq_hz: float, duration_ms: int = TONE_MS) -> pygame.mixer.Sound:
+    n_samples = max(8, int(SAMPLE_RATE * duration_ms / 1000))
+    t = np.arange(n_samples, dtype=np.float32) / SAMPLE_RATE
+    wave = np.sin(2.0 * np.pi * freq_hz * t) * TONE_VOL
+    pcm = np.int16(np.clip(wave * 32767.0, -32768, 32767))
+    stereo = np.column_stack((pcm, pcm))
+    return pygame.sndarray.make_sound(stereo)
 
 
 def main():
-    global timer, prev_timer, initial_time
-
     cam = cv.VideoCapture(0)
     cam.set(cv.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cam.set(cv.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
@@ -61,22 +89,40 @@ def main():
         print("Camera not opening")
         return
 
-    model_path = "./blaze_face_short_range.tflite"
+    model_path = Path(FACE_LANDMARKER_MODEL)
+    _ensure_face_landmarker_model(model_path)
+
     BaseOptions = mp.tasks.BaseOptions
-    FaceDetector = mp.tasks.vision.FaceDetector
-    FaceDetectorOptions = mp.tasks.vision.FaceDetectorOptions
+    FaceLandmarker = mp.tasks.vision.FaceLandmarker
+    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
     VisionRunningMode = mp.tasks.vision.RunningMode
-
-    options = FaceDetectorOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=VisionRunningMode.LIVE_STREAM,
-        result_callback=face_callback,
-        min_detection_confidence=0.7,
+    face_landmarker = FaceLandmarker.create_from_options(
+        FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(model_path)),
+            running_mode=VisionRunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.45,
+            min_face_presence_confidence=0.45,
+            min_tracking_confidence=0.45,
+        )
     )
+    device = torch.device("cpu")
+    emotion_model = create_binary_emotion_model().to(device)
+    emotion_model.load_state_dict(torch.load(EMOTION_MODEL_PATH, map_location=device))
+    emotion_model.eval()
+    emotion_transform = transforms.Compose(
+        [
+            transforms.Resize((256, 256), interpolation=InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    class_bias = torch.tensor(CLASS_LOGIT_BIAS, dtype=torch.float32, device=device).unsqueeze(0)
 
+    pygame.mixer.pre_init(SAMPLE_RATE, size=-16, channels=2, buffer=256)
     pygame.init()
     screen = pygame.display.set_mode((GAME_WIDTH + CAM_WIDTH, max(GAME_HEIGHT, CAM_HEIGHT)))
-    pygame.display.set_caption("Smile to Flap!")
+    pygame.display.set_caption("Eyes open = rise · Blink = fall")
     clock = pygame.time.Clock()
 
     # Load bird sprite (make black transparent)
@@ -92,21 +138,18 @@ def main():
 
     font = pygame.font.Font(None, 48)
     small_font = pygame.font.Font(None, 28)
+    audio_ok = True
+    try:
+        cue_channel = pygame.mixer.Channel(0)
+    except pygame.error:
+        audio_ok = False
+        cue_channel = None
+    next_pitch_time_ms = 0
 
-    # Emotion model
-    device = torch.device("cpu")
-    cnn = CNN()
-    cnn.load_state_dict(torch.load("emotion_set2.pth", map_location=device))
-    cnn.eval()
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((256, 256))])
-
-    # Smile smoothing: require majority smile over last few frames to trigger jump (reduces false jumps)
-    emotion_history = []
-    HISTORY_LEN = 5
-    SMILE_CLASS = 4
-    ANGER_CLASS = 0
-    jump_cooldown_frames = 0
-    COOLDOWN = 12  # frames between allowed jumps
+    eyes_open = True
+    pred_label = "none"
+    pred_conf = 0.0
+    pred_history = deque(maxlen=VOTE_WINDOW)
 
     # Game state
     bird_y = GAME_HEIGHT // 2 - BIRD_SIZE // 2
@@ -117,12 +160,16 @@ def main():
     frame_count = 0
 
     def reset_game():
-        nonlocal bird_y, bird_vel, pipes, score, game_over
+        nonlocal bird_y, bird_vel, pipes, score, game_over, eyes_open, pred_label, pred_conf, pred_history
         bird_y = GAME_HEIGHT // 2 - BIRD_SIZE // 2
         bird_vel = 0
         pipes.clear()
         score = 0
         game_over = False
+        eyes_open = True
+        pred_label = "none"
+        pred_conf = 0.0
+        pred_history.clear()
 
     def add_pipe():
         gap_y = np.random.randint(GROUND_HEIGHT + 80, GAME_HEIGHT - GROUND_HEIGHT - 80 - PIPE_GAP)
@@ -138,146 +185,149 @@ def main():
 
     add_pipe()
     pipe_spawn_counter = 0
+    running = True
 
-    with mp.tasks.vision.FaceDetector.create_from_options(options) as detector:
-        running = True
-        cropped_face = None
+    while running:
+        # Events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                reset_game()
 
-        while running:
-            frame_count += 1
-            initial_time = time.monotonic_ns() if frame_count == 1 else initial_time
-            timer = push_next_stamp(prev_timer, initial_time)
+        # Camera + face mesh (sync every frame = low-latency eye state)
+        ret, frame = cam.read()
+        if not ret:
+            continue
+        frame = cv.flip(frame, 1)
+        h, w, _ = frame.shape
 
-            # Events
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                    reset_game()
+        rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = int(time.monotonic_ns() // 1_000_000)
+        res = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+        if res.face_landmarks and len(res.face_landmarks) > 0:
+            lm = res.face_landmarks[0]
+            xs = [p.x for p in lm]
+            ys = [p.y for p in lm]
+            x0, y0 = int(min(xs) * w), int(min(ys) * h)
+            x1, y1 = int(max(xs) * w), int(max(ys) * h)
+            cv.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 1)
+            pad_x = int(0.25 * max(1, x1 - x0))
+            pad_y = int(0.25 * max(1, y1 - y0))
+            cx0 = max(0, x0 - pad_x)
+            cy0 = max(0, y0 - pad_y)
+            cx1 = min(w, x1 + pad_x)
+            cy1 = min(h, y1 + pad_y)
+            crop = frame[cy0:cy1, cx0:cx1]
+            if crop.size > 0:
+                pil = PIL.Image.fromarray(cv.cvtColor(crop, cv.COLOR_BGR2RGB))
+                model_in = emotion_transform(pil).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    logits = emotion_model(model_in) + class_bias
+                    probs = torch.softmax(logits, dim=1)
+                    pred_idx = int(torch.argmax(probs, dim=1).item())
+                    pred_conf = float(probs[0, pred_idx].item())
+                pred_history.append(pred_idx)
+                voted_idx = Counter(pred_history).most_common(1)[0][0]
+                pred_label = CLASS_NAMES[voted_idx]
+                eyes_open = voted_idx != BLINK_CLASS
+        else:
+            pred_history.append(BLINK_CLASS)
+            voted_idx = Counter(pred_history).most_common(1)[0][0]
+            pred_label = CLASS_NAMES[voted_idx]
+            eyes_open = voted_idx != BLINK_CLASS
+            pred_conf = 0.0
 
-            # Camera + face detection
-            ret, frame = cam.read()
-            if not ret:
-                continue
-            frame = cv.flip(frame, 1)
-            h, w, _ = frame.shape
-            face_bboxes = []
+        status = "OPEN" if eyes_open else "BLINK"
+        cv.putText(
+            frame,
+            f"model={pred_label} ({pred_conf:.2f})  {status}",
+            (8, 28),
+            cv.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0) if eyes_open else (0, 120, 255),
+            2,
+        )
 
-            if timer != prev_timer:
-                rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                detector.detect_async(mp_image, timer)
+        if not game_over:
+            bird_vel = RISE_SPEED if eyes_open else FALL_SPEED
+            bird_y += int(bird_vel)
+            bird_y = max(0, min(GAME_HEIGHT - GROUND_HEIGHT - BIRD_SIZE, bird_y))
 
-            if latest_res["result"]:
-                for det in latest_res["result"].detections:
-                    bbox = det.bounding_box
-                    x, y, bw, bh = bbox.origin_x, bbox.origin_y, bbox.width, bbox.height
-                    face_bboxes.append((x, y, bw, bh))
-                    # Crop with padding for emotion model
-                    x1 = max(0, x - bw // 2)
-                    y1 = max(0, y - bh // 2)
-                    x2 = min(w, x + bw + bw // 2)
-                    y2 = min(h, y + bh + bh // 2)
-                    cropped_face = frame[y1:y2, x1:x2]
-                    if cropped_face.size > 0:
-                        cropped_face = cv.resize(cropped_face, (256, 256))
-            else:
-                cropped_face = None
+            if audio_ok:
+                now_ms = pygame.time.get_ticks()
+                if now_ms >= next_pitch_time_ms:
+                    # Higher bird -> higher pitch
+                    play_area = GAME_HEIGHT - GROUND_HEIGHT - BIRD_SIZE
+                    height_ratio = 1.0 - (bird_y / max(1, play_area))
+                    freq = PITCH_MIN_HZ + (PITCH_MAX_HZ - PITCH_MIN_HZ) * height_ratio
+                    tone = _make_tone(freq)
+                    cue_channel.play(tone)
+                    next_pitch_time_ms = now_ms + PITCH_UPDATE_MS
 
-            # Draw face bounding boxes on camera frame
-            for (x, y, bw, bh) in face_bboxes:
-                cv.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            pipe_spawn_counter += 1
+            if pipe_spawn_counter >= PIPE_SPAWN_INTERVAL:
+                add_pipe()
+                pipe_spawn_counter = 0
 
-            # Emotion -> jump when smile (class 4)
-            if cropped_face is not None and cropped_face.size > 0 and not game_over and jump_cooldown_frames <= 0:
-                try:
-                    pil_img = PIL.Image.fromarray(cv.cvtColor(cropped_face, cv.COLOR_BGR2RGB))
-                    tensor_in = transform(pil_img).unsqueeze(0)
-                    with torch.no_grad():
-                        out = cnn(tensor_in)
-                    pred = torch.argmax(out, dim=1).item()
-                    emotion_history.append(pred)
-                    if len(emotion_history) > HISTORY_LEN:
-                        emotion_history.pop(0)
-                    if len(emotion_history) == HISTORY_LEN and sum(1 for x in emotion_history if x == ANGER_CLASS) >= 3:
-                        bird_vel = JUMP_VEL
-                        jump_cooldown_frames = COOLDOWN
-                except Exception:
-                    pass
+            for p in pipes:
+                p["x"] -= PIPE_SPEED
 
-            if jump_cooldown_frames > 0:
-                jump_cooldown_frames -= 1
+            pipes = [p for p in pipes if p["x"] + PIPE_WIDTH > 0]
 
-            # Game update
-            if not game_over:
-                bird_vel += GRAVITY
-                bird_y += int(bird_vel)
-                bird_y = max(0, min(GAME_HEIGHT - GROUND_HEIGHT - BIRD_SIZE, bird_y))
+            if len(pipes) == 0:
+                add_pipe()
 
-                pipe_spawn_counter += 1
-                if pipe_spawn_counter >= PIPE_SPAWN_INTERVAL:
-                    add_pipe()
-                    pipe_spawn_counter = 0
+            for p in pipes:
+                if not p["scored"] and p["x"] + PIPE_WIDTH < BIRD_X:
+                    p["scored"] = True
+                    score += 1
 
-                for p in pipes:
-                    p["x"] -= PIPE_SPEED
-
-                pipes = [p for p in pipes if p["x"] + PIPE_WIDTH > 0]
-
-                if len(pipes) == 0:
-                    add_pipe()
-
-                # Score when bird passes pipe
-                for p in pipes:
-                    if not p["scored"] and p["x"] + PIPE_WIDTH < BIRD_X:
-                        p["scored"] = True
-                        score += 1
-
-                # Collision
-                br = bird_rect()
-                for p in pipes:
-                    top_r, bot_r = pipe_rects(p)
-                    if br.colliderect(top_r) or br.colliderect(bot_r):
-                        game_over = True
-                        break
-                if bird_y >= GAME_HEIGHT - GROUND_HEIGHT - BIRD_SIZE or bird_y <= 0:
-                    game_over = True
-
-            # Draw game (left side)
-            screen.fill(SKY_COLOR, (0, 0, GAME_WIDTH, GAME_HEIGHT))
+            br = bird_rect()
             for p in pipes:
                 top_r, bot_r = pipe_rects(p)
-                pygame.draw.rect(screen, PIPE_COLOR, top_r)
-                pygame.draw.rect(screen, (20, 100, 20), top_r, 2)
-                pygame.draw.rect(screen, PIPE_COLOR, bot_r)
-                pygame.draw.rect(screen, (20, 100, 20), bot_r, 2)
-            pygame.draw.rect(screen, GROUND_COLOR, (0, GAME_HEIGHT - GROUND_HEIGHT, GAME_WIDTH, GROUND_HEIGHT))
-            screen.blit(bird_surf, (BIRD_X, bird_y))
+                if br.colliderect(top_r) or br.colliderect(bot_r):
+                    game_over = True
+                    break
+            if bird_y >= GAME_HEIGHT - GROUND_HEIGHT - BIRD_SIZE or bird_y <= 0:
+                game_over = True
 
-            score_text = font.render(str(score), True, BLACK)
-            screen.blit(score_text, (GAME_WIDTH // 2 - score_text.get_width() // 2, 30))
+        screen.fill(SKY_COLOR, (0, 0, GAME_WIDTH, GAME_HEIGHT))
+        for p in pipes:
+            top_r, bot_r = pipe_rects(p)
+            pygame.draw.rect(screen, PIPE_COLOR, top_r)
+            pygame.draw.rect(screen, (20, 100, 20), top_r, 2)
+            pygame.draw.rect(screen, PIPE_COLOR, bot_r)
+            pygame.draw.rect(screen, (20, 100, 20), bot_r, 2)
+        pygame.draw.rect(screen, GROUND_COLOR, (0, GAME_HEIGHT - GROUND_HEIGHT, GAME_WIDTH, GROUND_HEIGHT))
+        screen.blit(bird_surf, (BIRD_X, bird_y))
 
-            if game_over:
-                over_text = font.render("Game Over", True, BLACK)
-                screen.blit(over_text, (GAME_WIDTH // 2 - over_text.get_width() // 2, GAME_HEIGHT // 2 - 30))
-                hint = small_font.render("Press R to reset", True, BLACK)
-                screen.blit(hint, (GAME_WIDTH // 2 - hint.get_width() // 2, GAME_HEIGHT // 2 + 20))
+        score_text = font.render(str(score), True, BLACK)
+        screen.blit(score_text, (GAME_WIDTH // 2 - score_text.get_width() // 2, 30))
 
-            # Draw camera feed (right side) with face boxes already drawn on frame
-            rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-            try:
-                cam_surf = pygame.image.frombuffer(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), "RGB")
-            except AttributeError:
-                cam_surf = pygame.image.fromstring(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), "RGB")
-            cam_surf = pygame.transform.scale(cam_surf, (CAM_WIDTH, CAM_HEIGHT))
-            screen.blit(cam_surf, (GAME_WIDTH, 0))
-            label = small_font.render("Smile to jump!", True, WHITE)
-            screen.blit(label, (GAME_WIDTH + 10, 10))
+        if game_over:
+            over_text = font.render("Game Over", True, BLACK)
+            screen.blit(over_text, (GAME_WIDTH // 2 - over_text.get_width() // 2, GAME_HEIGHT // 2 - 30))
+            hint = small_font.render("Press R to reset", True, BLACK)
+            screen.blit(hint, (GAME_WIDTH // 2 - hint.get_width() // 2, GAME_HEIGHT // 2 + 20))
 
-            pygame.display.flip()
-            prev_timer = timer
-            clock.tick(60)
+        rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        try:
+            cam_surf = pygame.image.frombuffer(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), "RGB")
+        except AttributeError:
+            cam_surf = pygame.image.fromstring(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), "RGB")
+        cam_surf = pygame.transform.scale(cam_surf, (CAM_WIDTH, CAM_HEIGHT))
+        screen.blit(cam_surf, (GAME_WIDTH, 0))
+        label = small_font.render("Eyes open = rise   Blink = fall", True, WHITE)
+        screen.blit(label, (GAME_WIDTH + 10, 10))
 
+        pygame.display.flip()
+        clock.tick(60)
+
+    face_landmarker.close()
+    if audio_ok:
+        pygame.mixer.stop()
     cam.release()
     cv.destroyAllWindows()
     pygame.quit()
